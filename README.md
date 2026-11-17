@@ -39,6 +39,10 @@ than 2^53 and JavaScript numbers would lose precision. It reads back from both
 strings and numbers, and works as a JSON map key. `Parse` accepts only the
 canonical form, so `"007"` and `"+7"` are rejected.
 
+`ID` is a `uint64`, but its top bit is never set, so every ID fits in a signed
+64-bit column such as Postgres `bigint`; `Int64()` converts without loss.
+`Parse` and JSON decoding reject values above `math.MaxInt64`.
+
 `ID()` never returns 0, so the zero value can mean "no ID".
 
 ## Options

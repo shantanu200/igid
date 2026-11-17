@@ -8,9 +8,10 @@
 // [WithShards] moves the split: for example, 1,024 shards that can each
 // issue 8,192 IDs per millisecond.
 //
-// IDs are stored in a signed int64, so the top timestamp bit
-// doubles as the sign bit: IDs stay positive for about 34.8 years after the
-// epoch. Use [WithEpoch] to pick a recent epoch and get the most time.
+// IDs are uint64 values, but the top timestamp bit is never set, so every
+// ID also fits in a signed int64 (such as a Postgres bigint). That leaves 40
+// bits of time: about 34.8 years after the epoch. Use [WithEpoch] to pick a
+// recent epoch and get the most time.
 //
 // IDs are larger than 2^53, so JavaScript cannot hold them exactly as
 // numbers. The [ID] type marshals to a JSON string for this reason.
@@ -54,9 +55,13 @@ const (
 	// timeShift is how far the timestamp is shifted left.
 	timeShift = layoutBits
 
-	// maxElapsedMs is the largest elapsed time that keeps the ID positive.
-	// 64 - 23 = 41 bits, minus the sign bit = 40.
+	// maxElapsedMs is the largest elapsed time that keeps the ID within
+	// maxID. 64 - 23 = 41 bits, minus the top bit = 40.
 	maxElapsedMs = 1<<(63-timeShift) - 1
+
+	// maxID is the largest ID this package issues or accepts. Keeping the
+	// top bit clear means every ID converts to int64 without loss.
+	maxID = 1<<63 - 1
 
 	// pollInterval is how often ID rechecks the clock while waiting for
 	// the next millisecond.
@@ -184,13 +189,14 @@ var defaultLayout = newLayout(ShardBits)
 //
 // If id is ahead of the clock by up to the allowed drift (see
 // WithMaxDrift), the first call to ID waits for the clock to catch up.
-// If it is further ahead, New returns ErrClockBackwards. A negative id
-// makes New return ErrInvalidOption. id is decoded with the Node's epoch,
+// If it is further ahead, New returns ErrClockBackwards. An id above
+// math.MaxInt64, which this package never issues, makes New return
+// ErrInvalidOption. id is decoded with the Node's epoch,
 // whatever order the options are given in.
 func WithLastID(id ID) Option {
 	return func(n *Node) {
-		if id < 0 {
-			n.optErr = fmt.Errorf("%w: WithLastID(%d): ID must not be negative", ErrInvalidOption, id)
+		if id > maxID {
+			n.optErr = fmt.Errorf("%w: WithLastID(%d): ID must not exceed %d", ErrInvalidOption, id, uint64(maxID))
 			return
 		}
 		n.lastID, n.hasLastID = id, true
@@ -294,13 +300,13 @@ func New(shardID int64, opts ...Option) (*Node, error) {
 	n.lastMs, n.seq = now, 0
 
 	if n.hasLastID {
-		lastMs := int64(n.lastID)>>timeShift + n.epochMs
+		lastMs := int64(n.lastID>>timeShift) + n.epochMs
 		if lastMs >= now {
 			if ahead := lastMs - now; ahead > n.maxDrift {
 				return nil, fmt.Errorf("%w: last ID is %dms ahead of the clock", ErrClockBackwards, ahead)
 			}
 			// ID treats this like a small backward clock step and waits.
-			n.lastMs, n.seq = lastMs, int64(n.lastID)&n.maxSeq
+			n.lastMs, n.seq = lastMs, int64(n.lastID&ID(n.maxSeq))
 		}
 	}
 	return n, nil
@@ -392,10 +398,10 @@ type Parts struct {
 // layout of 8,192 shards. For IDs made with a custom epoch only, use
 // DecodeWithEpoch; for IDs made with WithShards, use Node.Decode.
 //
-// Negative IDs are never issued, and Parse and JSON decoding reject them.
-// Decoding one (for example, from an ID(x) conversion of bad data) returns
-// parts that look valid but mean nothing; check id >= 0 first if the
-// value did not come from this package.
+// IDs above math.MaxInt64 are never issued, and Parse and JSON decoding
+// reject them. Decoding one (for example, from an ID(x) conversion of bad
+// data) returns parts that look valid but mean nothing; check
+// id <= math.MaxInt64 first if the value did not come from this package.
 func Decode(id ID) Parts { return decode(id, DefaultEpoch.UnixMilli(), defaultLayout) }
 
 // DecodeWithEpoch splits id into its parts using the given epoch and the
@@ -405,11 +411,10 @@ func DecodeWithEpoch(id ID, epoch time.Time) Parts {
 }
 
 func decode(id ID, epochMs int64, l layout) Parts {
-	v := int64(id)
 	return Parts{
-		Time:  time.UnixMilli(v>>timeShift + epochMs).UTC(),
-		Shard: v >> l.seqBits & l.maxShard,
-		Seq:   v & l.maxSeq,
+		Time:  time.UnixMilli(int64(id>>timeShift) + epochMs).UTC(),
+		Shard: int64(id>>l.seqBits) & l.maxShard,
+		Seq:   int64(id) & l.maxSeq,
 	}
 }
 
@@ -417,29 +422,34 @@ func decode(id ID, epochMs int64, l layout) Parts {
 // "3930684247638020", so JavaScript clients do not lose precision.
 // When reading JSON, both strings and plain numbers are accepted.
 //
+// The top bit is never set, so every ID converts to int64 without loss
+// (see [ID.Int64]).
+//
 // Node.ID never returns 0, so the zero value can mean "no ID".
-type ID int64
+type ID uint64
 
 // Parse converts a base-10 string into an ID. Only the canonical form that
 // String produces is accepted: no sign and no leading zeros, so "7" parses
 // but "+7", "007" and "-0" do not. Each ID therefore has exactly one
 // string form, which keeps string-keyed caches and lookups consistent.
+// Values above math.MaxInt64 are rejected, since no ID can hold them.
 func Parse(s string) (ID, error) {
-	v, err := strconv.ParseInt(s, 10, 64)
-	// ParseInt accepted s, so it is non-empty and an optional sign followed
-	// by digits. Requiring a leading 1-9 (or exactly "0") rules out signs,
-	// which covers negatives, and leading zeros.
-	if err != nil || (s != "0" && (s[0] < '1' || s[0] > '9')) {
+	v, err := strconv.ParseUint(s, 10, 64)
+	// ParseUint accepted s, so it is non-empty, all digits and has no sign.
+	// Requiring a leading 1-9 (or exactly "0") rules out leading zeros.
+	if err != nil || v > maxID || (s != "0" && s[0] == '0') {
 		return 0, fmt.Errorf("%w: %q", ErrInvalidID, s)
 	}
 	return ID(v), nil
 }
 
-// Int64 returns the ID as an int64, for storing in a database.
+// Int64 returns the ID as an int64, for storing in a database column such
+// as a Postgres bigint. It is lossless for every ID this package issues or
+// parses.
 func (id ID) Int64() int64 { return int64(id) }
 
 // String returns the ID in base 10.
-func (id ID) String() string { return strconv.FormatInt(int64(id), 10) }
+func (id ID) String() string { return strconv.FormatUint(uint64(id), 10) }
 
 // MarshalJSON writes the ID as a JSON string.
 func (id ID) MarshalJSON() ([]byte, error) {

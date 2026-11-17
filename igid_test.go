@@ -523,16 +523,16 @@ func TestDecodeEpochs(t *testing.T) {
 	}
 }
 
-func TestDecodeNegativeID(t *testing.T) {
-	// Negative IDs are never issued; Decode must not panic on one, and
+func TestDecodeIDAboveMaxInt64(t *testing.T) {
+	// IDs above MaxInt64 are never issued; Decode must not panic on one, and
 	// its fields stay in their ranges even though they mean nothing.
-	for _, v := range []int64{-1, math.MinInt64} {
-		p := igid.Decode(igid.ID(v))
+	for _, v := range []uint64{math.MaxInt64 + 1, math.MaxUint64} {
+		p := igid.DecodeWithEpoch(igid.ID(v), testEpoch)
 		if p.Shard < 0 || p.Shard > igid.MaxShard || p.Seq < 0 || p.Seq > igid.MaxSeq {
 			t.Errorf("Decode(%d) = %+v, field out of range", v, p)
 		}
-		if !p.Time.Before(igid.DefaultEpoch) {
-			t.Errorf("Decode(%d) time = %v, want before epoch", v, p.Time)
+		if elapsed := p.Time.UnixMilli() - testEpochMs; elapsed <= maxElapsedMs {
+			t.Errorf("Decode(%d) elapsed = %d, want past %d", v, elapsed, int64(maxElapsedMs))
 		}
 	}
 }
@@ -825,8 +825,8 @@ func TestWithLastID(t *testing.T) {
 		}
 	})
 
-	t.Run("negative is rejected", func(t *testing.T) {
-		if _, err := igid.New(2, igid.WithLastID(-1)); !errors.Is(err, igid.ErrInvalidOption) {
+	t.Run("above MaxInt64 is rejected", func(t *testing.T) {
+		if _, err := igid.New(2, igid.WithLastID(math.MaxInt64+1)); !errors.Is(err, igid.ErrInvalidOption) {
 			t.Fatalf("New error = %v, want ErrInvalidOption", err)
 		}
 	})
@@ -848,6 +848,8 @@ func TestParse(t *testing.T) {
 		{" 1", 0, true},
 		{"0x10", 0, true},
 		{"9223372036854775808", 0, true},
+		{"18446744073709551615", 0, true},
+		{"18446744073709551616", 0, true},
 		{"+5", 0, true},
 		{"-0", 0, true},
 		{"+0", 0, true},
@@ -930,6 +932,7 @@ func TestJSONUnmarshal(t *testing.T) {
 		{`1e3`, 0, true},
 		{`true`, 0, true},
 		{`"9223372036854775808"`, 0, true},
+		{`18446744073709551615`, 0, true},
 		{`"+5"`, 0, true},
 		{`"007"`, 0, true},
 		{`"1"`, 1, false},
@@ -1030,7 +1033,7 @@ func TestText(t *testing.T) {
 }
 
 func FuzzParseRoundTrip(f *testing.F) {
-	for _, s := range []string{"0", "1", "8388613120", "9223372036854775807", "-1", "abc", ""} {
+	for _, s := range []string{"0", "1", "8388613120", "9223372036854775807", "9223372036854775808", "-1", "abc", ""} {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, s string) {
@@ -1038,8 +1041,8 @@ func FuzzParseRoundTrip(f *testing.F) {
 		if err != nil {
 			return
 		}
-		if id < 0 {
-			t.Fatalf("Parse(%q) = %d, negative", s, id)
+		if id > math.MaxInt64 {
+			t.Fatalf("Parse(%q) = %d, above MaxInt64", s, id)
 		}
 		// Only the canonical form parses, so it must match String exactly.
 		if got := id.String(); got != s {
